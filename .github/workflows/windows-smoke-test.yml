@@ -1,0 +1,114 @@
+name: Windows smoke test
+
+on:
+  push:
+  workflow_dispatch: {}
+
+jobs:
+  windows-smoke-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Build with Maven
+        run: mvn -B clean package
+
+      - name: Assemble distribution folder (mirrors the submission zip layout)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\lib | Out-Null
+          Copy-Item gm-ui\target\gm-ui.jar dist\gm-ui.jar
+          Copy-Item gm-ui\target\lib\* dist\lib\
+          Copy-Item run.bat dist\run.bat
+
+      - name: Smoke test - load, list, buy, close (single.xml)
+        shell: pwsh
+        run: |
+          $lines = @(
+            "1", "testfiles\single.xml",
+            "2",
+            "4", "1", "1", "100",
+            "3", "1",
+            "5", "1", "1",
+            "8"
+          )
+          Set-Content -Path in1.txt -Value $lines
+          cmd /c "java -jar dist\gm-ui.jar < in1.txt > out1.txt 2>&1"
+          $out = Get-Content out1.txt -Raw
+          Write-Host $out
+          if ($out -match "Exception in thread") { throw "Application crashed (uncaught exception detected)" }
+          if ($out -notmatch "File loaded successfully\. 1 event\(s\) were loaded\.") { throw "Load did not report success" }
+          if ($out -notmatch "Purchase completed\.") { throw "Purchase flow did not complete" }
+          if ($out -notmatch "Event closed\.") { throw "Close flow did not complete" }
+
+      - name: Smoke test - reject invalid files without crashing
+        shell: pwsh
+        run: |
+          $lines = @(
+            "1", "testfiles\error-2.xml",
+            "1", "testfiles\error-3.xml",
+            "8"
+          )
+          Set-Content -Path in2.txt -Value $lines
+          cmd /c "java -jar dist\gm-ui.jar < in2.txt > out2.txt 2>&1"
+          $out = Get-Content out2.txt -Raw
+          Write-Host $out
+          if ($out -match "Exception in thread") { throw "Application crashed on an invalid file (uncaught exception detected)" }
+          if ($out -notmatch "Each event must have a unique id") { throw "Duplicate id was not rejected as expected" }
+          if ($out -notmatch "Commission must be between 0 and 90") { throw "Invalid commission was not rejected as expected" }
+
+      - name: Smoke test - path containing spaces
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "test folder with spaces" | Out-Null
+          Copy-Item testfiles\single.xml "test folder with spaces\events.xml"
+          $path = (Resolve-Path "test folder with spaces\events.xml").Path
+          Set-Content -Path in3.txt -Value @("1", $path, "8")
+          cmd /c "java -jar dist\gm-ui.jar < in3.txt > out3.txt 2>&1"
+          $out = Get-Content out3.txt -Raw
+          Write-Host $out
+          if ($out -match "Exception in thread") { throw "Application crashed on a path containing spaces" }
+          if ($out -notmatch "File loaded successfully") { throw "Failed to load a file from a path containing spaces" }
+
+      - name: Smoke test - multiple.xml loads all three events
+        shell: pwsh
+        run: |
+          Set-Content -Path in4.txt -Value @("1", "testfiles\multiple.xml", "2", "8")
+          cmd /c "java -jar dist\gm-ui.jar < in4.txt > out4.txt 2>&1"
+          $out = Get-Content out4.txt -Raw
+          Write-Host $out
+          if ($out -match "Exception in thread") { throw "Application crashed loading multiple.xml" }
+          if ($out -notmatch "File loaded successfully\. 3 event\(s\) were loaded\.") { throw "multiple.xml did not report 3 events loaded" }
+
+      - name: Smoke test - save and load application state (bonus)
+        shell: pwsh
+        run: |
+          $savePath = (Join-Path (Get-Location) "mysave")
+          $saveLines = @(
+            "1", "testfiles\single.xml",
+            "4", "1", "1", "100",
+            "6", $savePath,
+            "8"
+          )
+          Set-Content -Path in5.txt -Value $saveLines
+          cmd /c "java -jar dist\gm-ui.jar < in5.txt > out5.txt 2>&1"
+          $out5 = Get-Content out5.txt -Raw
+          Write-Host $out5
+          if ($out5 -match "Exception in thread") { throw "Application crashed while saving state" }
+          if ($out5 -notmatch "Application state saved successfully\.") { throw "Save did not report success" }
+          if (-not (Test-Path "$savePath.gmstate")) { throw "Save file was not created on disk" }
+
+          $loadLines = @("7", $savePath, "3", "1", "8")
+          Set-Content -Path in6.txt -Value $loadLines
+          cmd /c "java -jar dist\gm-ui.jar < in6.txt > out6.txt 2>&1"
+          $out6 = Get-Content out6.txt -Raw
+          Write-Host $out6
+          if ($out6 -match "Exception in thread") { throw "Application crashed while loading saved state" }
+          if ($out6 -notmatch "Application state loaded successfully\.") { throw "Load did not report success" }
+          if ($out6 -notmatch "total shares bought: 100") { throw "Loaded state did not preserve the earlier purchase" }
